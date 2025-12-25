@@ -25,7 +25,7 @@
       -webkit-font-smoothing:antialiased;
     }
     .container{max-width:1100px;margin:28px auto;padding:20px}
-    header{display:flex;gap:12px;align-items:center;justify-content:space-between}
+    header{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
     .brand{display:flex;gap:12px;align-items:center}
     .logo{width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-weight:800;color:#022}
     h1{margin:0;font-size:20px}
@@ -142,6 +142,7 @@
         <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
           <button id="togglePublicEditBtn">Переключить публичное редактирование</button>
           <button onclick="downloadLocalBackup()">Экспорт локально</button>
+          <button onclick="loadCloudToLocal()" title="Принудительно загрузить состояние из облака (перезапишет локальные данные)">Загрузить из облака (force)</button>
           <label>
             <input type="file" id="importFile" accept="application/json" style="display:none">
             <button onclick="document.getElementById('importFile').click()">Импорт данных</button>
@@ -266,7 +267,7 @@
 
   <script>
   /**************************************************************************
-   * CONFIGURATION: вставлен ваш Firebase-конфиг
+   * CONFIGURATION: вставлен ваш Firebase-конфиг (проверьте, что домен добавлен)
    **************************************************************************/
   const FIREBASE_ENABLED = true;
   const firebaseConfig = {
@@ -280,109 +281,177 @@
   };
 
   /******************************* DATA MODEL ********************************/
-  const STORAGE_KEY = 'nova_zemlya_data_v4';
+  const STORAGE_KEY = 'nova_zemlya_data_v5';
   const LOCAL_ROLE_KEY = 'nova_zemlya_local_role';
+
   const defaultData = {
-    meta: { ownerName:'Владелец', ownerPass:'owner123', adminPass:'admin123', publicEdit:false, ownerUid:null, admins:[] },
-    map: { dataUrl:'', name:'' },
-    players: [ {id:1,name:'МЕТАМФИЛЕНД',army:0,pop:7,territories:24,happy:50,energy:50}, {id:2,name:'СнюсЛенд',army:0,pop:7,territories:0,happy:50,energy:50} ],
+    meta: {
+      ownerName: 'Владелец',
+      ownerPass: 'owner123',
+      adminPass: 'admin123',
+      publicEdit: false,
+      ownerUid: null,
+      admins: []
+    },
+    map: { dataUrl: '', name: '' },
+    // <-- Вставлены племена, которые вы просили по умолчанию
+    players: [
+      { id: 1, name: 'МЕТАМФИЛЕНД', army: 0, pop: 5, territories: 5, happy: 50, energy: 50 },
+      { id: 2, name: 'СнюсЛенд', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 3, name: 'Тульбинск', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 4, name: 'Б.Д.М.Г', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 5, name: 'Бур', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 6, name: 'пердешград', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 7, name: 'С.Б.У', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 8, name: 'С.К.Д.П.МФА.А', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 9, name: 'ZOVленд', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 10, name: 'нимцефилия', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 },
+      { id: 11, name: 'Винланд', army: 0, pop: 5, territories: 0, happy: 50, energy: 50 }
+    ],
     explain: {},
     updatedAt: Date.now()
   };
 
-  let state = loadStateLocal();
-  let role = 'guest';               // effective role shown in UI (may be local or cloud-derived)
-  let localRole = loadLocalRole();  // "admin" | "owner" | null — persisted locally for test convenience
+  let state = null;
+  let role = 'guest';
+  let localRole = null;
   let currentUser = null;
-  let firebaseApp=null, auth=null, db=null, storage=null, unsubscribe=null;
+  let firebaseApp = null, auth = null, db = null, storage = null, unsubscribe = null;
   let lastMapFile = null;
+  let listeningToCloud = false;
 
-  // Init Firebase safely
-  if(FIREBASE_ENABLED && firebaseConfig && firebaseConfig.apiKey){
+  /* ---------------- init & firebase ---------------- */
+  function loadLocalRole(){ try { return localStorage.getItem(LOCAL_ROLE_KEY) || null; } catch(e){ return null; } }
+  function saveLocalRole(v){ try { if(v) localStorage.setItem(LOCAL_ROLE_KEY, v); else localStorage.removeItem(LOCAL_ROLE_KEY); localRole = v; } catch(e){} }
+
+  function loadStateLocalRaw(){ const raw = localStorage.getItem(STORAGE_KEY); if(!raw) return null; try { return JSON.parse(raw); } catch(e) { return null; } }
+  function loadStateLocal(){ const raw = loadStateLocalRaw(); if(!raw){ localStorage.setItem(STORAGE_KEY, JSON.stringify(defaultData)); return JSON.parse(JSON.stringify(defaultData)); } raw.explain = raw.explain || {}; return raw; }
+  function saveStateLocal(){ state.updatedAt = Date.now(); localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); renderAll(); updateLastSaved(); }
+
+  function firebaseAvailable(){ return FIREBASE_ENABLED && typeof firebase !== 'undefined' && db; }
+
+  // Initialize Firebase and try to sync cloud once on start
+  async function initFirebaseAndSync(){
+    if(!FIREBASE_ENABLED) { state = loadStateLocal(); renderAll(); updateVisibility(); return; }
     try {
       firebaseApp = firebase.initializeApp(firebaseConfig);
       auth = firebase.auth();
       db = firebase.firestore();
       storage = firebase.storage();
-      auth.onAuthStateChanged(async user=>{
-        currentUser = user;
-        if(user){
-          document.getElementById('signinBtn').innerText = 'Войти как: ' + (user.displayName || user.email);
-          document.getElementById('signoutBtn').classList.remove('hidden');
-          // subscribeCloud will set role according to cloud + fallback to localRole if cloud has no owners/admins
-          await subscribeCloud();
-        } else {
-          // logged out from cloud — restore local state and local role if set
-          document.getElementById('signinBtn').innerText = 'Войти (Google)';
-          document.getElementById('signoutBtn').classList.add('hidden');
-          if(unsubscribe){ unsubscribe(); unsubscribe=null; }
-          state = loadStateLocal();
-          role = localRole || 'guest';
-          renderAll();
-          updateVisibility();
-        }
-      });
-    } catch(e){ console.error('Firebase init error', e); toast('Firebase не инициализирован — работаем локально'); updateVisibility(); }
-  } else {
-    updateVisibility();
-  }
-
-  /* ---------------- local storage ---------------- */
-  function loadLocalRole(){ try{ const r=localStorage.getItem(LOCAL_ROLE_KEY); return r?r:null; }catch(e){ return null; } }
-  function saveLocalRole(val){ try{ if(val) localStorage.setItem(LOCAL_ROLE_KEY, val); else localStorage.removeItem(LOCAL_ROLE_KEY); localRole = val; }catch(e){} }
-  function loadStateLocal(){ const raw = localStorage.getItem(STORAGE_KEY); if(!raw){ localStorage.setItem(STORAGE_KEY, JSON.stringify(defaultData)); return JSON.parse(JSON.stringify(defaultData)); } try{ const parsed = JSON.parse(raw); parsed.explain = parsed.explain || {}; return parsed; }catch(e){ localStorage.setItem(STORAGE_KEY, JSON.stringify(defaultData)); return JSON.parse(JSON.stringify(defaultData)); } }
-  function saveStateLocal(){ state.updatedAt = Date.now(); localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); renderAll(); updateLastSaved(); }
-
-  /* ---------------- cloud ---------------- */
-  async function subscribeCloud(){
-    if(!db) return;
-    const ref = db.collection('site').doc('state');
-    const snap = await ref.get();
-    if(!snap.exists){ await ref.set(state); }
-    unsubscribe = ref.onSnapshot(snap=>{
-      if(!snap.exists) return;
-      const cloud = snap.data();
-      if(!state.updatedAt || (cloud.updatedAt && cloud.updatedAt > state.updatedAt)){
-        state = cloud;
-        saveStateLocal();
-        toast('Данные синхронизированы из облака');
-      }
+    } catch(e) {
+      console.error('Firebase init failed', e);
+      toast('Firebase не инициализирован — работаем локально');
+      state = loadStateLocal();
       renderAll();
       updateVisibility();
+      return;
+    }
+
+    // Attempt an unauthenticated read of the state doc (works if Firestore rules allow read)
+    try {
+      const ref = db.collection('site').doc('state');
+      const snap = await ref.get();
+      if(!snap.exists){
+        // if no doc — initialize cloud with default (attempt; if rules block, fallback)
+        try {
+          await ref.set(defaultData);
+          state = JSON.parse(JSON.stringify(defaultData));
+          saveStateLocal();
+          console.info('Created cloud state from default');
+        } catch(e) {
+          // cannot write (probably rules): fall back to local
+          console.warn('Cannot write default to cloud (permissions). Using local state.', e);
+          state = loadStateLocal();
+        }
+      } else {
+        // cloud exists: apply it
+        const cloud = snap.data();
+        state = cloud;
+        saveStateLocal();
+        console.info('Loaded state from cloud on init');
+      }
+
+      // Setup realtime listener (if allowed)
+      try {
+        if(!listeningToCloud){
+          unsubscribe = ref.onSnapshot(snap => {
+            if(!snap.exists) return;
+            const cloud = snap.data();
+            // apply only if cloud is newer
+            if(!state.updatedAt || (cloud.updatedAt && cloud.updatedAt > state.updatedAt)){
+              state = cloud;
+              saveStateLocal();
+              renderAll();
+              toast('Данные синхронизированы из облака');
+            }
+          }, err => {
+            console.warn('onSnapshot error', err);
+          });
+          listeningToCloud = true;
+        }
+      } catch(e){
+        console.warn('Cannot open realtime snapshot (might be rules)', e);
+      }
+    } catch(e) {
+      console.warn('Cloud read failed, using local', e);
+      state = loadStateLocal();
+    }
+
+    // Auth listener: will recalc roles when user logs in/out
+    auth.onAuthStateChanged(async user => {
+      currentUser = user;
+      if(user){
+        document.getElementById('signinBtn').innerText = 'Войти как: ' + (user.displayName || user.email);
+        document.getElementById('signoutBtn').classList.remove('hidden');
+        // If no state yet, try to fetch again (auth may allow)
+        try {
+          const ref = db.collection('site').doc('state');
+          const snap = await ref.get();
+          if(snap.exists){
+            const cloud = snap.data();
+            // prefer cloud if newer
+            if(!state.updatedAt || (cloud.updatedAt && cloud.updatedAt >= state.updatedAt)){
+              state = cloud;
+              saveStateLocal();
+              renderAll();
+            }
+          }
+        } catch(err){ console.warn('Post-auth fetch failed', err); }
+        // determine role
+        determineRoleFromState();
+        updateVisibility();
+      } else {
+        document.getElementById('signinBtn').innerText = 'Войти (Google)';
+        document.getElementById('signoutBtn').classList.add('hidden');
+        // logged out: use local role if available
+        determineRoleFromState();
+        updateVisibility();
+      }
     });
-    // determine role based on uid
-    role = 'guest';
-    if(currentUser && state.meta){
-      if(state.meta.ownerUid && currentUser.uid === state.meta.ownerUid) role='owner';
-      else if(Array.isArray(state.meta.admins) && state.meta.admins.includes(currentUser.uid)) role='admin';
-    }
-    // fallback: if cloud has no owner/admins configured, allow localRole to act as admin for convenience
-    const cloudHasAdmins = state.meta && (state.meta.ownerUid || (Array.isArray(state.meta.admins) && state.meta.admins.length>0));
-    if(role==='guest' && localRole && !cloudHasAdmins){
-      role = localRole;
-    }
+
+    // initial localRole load
+    localRole = loadLocalRole();
+    // if everything above done, render
+    renderAll();
     updateVisibility();
   }
 
-  async function saveStateCloud(){ if(!db) return saveStateLocal(); if(!canEditCloud()){ toast('Нет прав для записи в облако'); return; } const ref = db.collection('site').doc('state'); state.updatedAt = Date.now(); await ref.set(state); saveStateLocal(); toast('Данные сохранены в облаке'); updateLastSaved(); }
-  function canEditCloud(){ if(!currentUser || !state.meta) return false; if(state.meta.ownerUid && currentUser.uid === state.meta.ownerUid) return true; if(Array.isArray(state.meta.admins) && state.meta.admins.includes(currentUser.uid)) return true; return false; }
-  function canEdit(){
-    // if logged into Firebase + DB: prefer cloud permissions, but allow localRole if cloud isn't configured
-    if(FIREBASE_ENABLED && db && currentUser){
-      if(canEditCloud()) return true;
-      const cloudHasAdmins = state.meta && (state.meta.ownerUid || (Array.isArray(state.meta.admins) && state.meta.admins.length>0));
-      if(!cloudHasAdmins && localRole) return (localRole==='owner' || localRole==='admin');
-      return false;
+  function determineRoleFromState(){
+    // compute role (UI badge) based on cloud if user logged in and cloud meta present
+    role = 'guest';
+    if(currentUser && state && state.meta){
+      if(state.meta.ownerUid && currentUser.uid === state.meta.ownerUid) role = 'owner';
+      else if(Array.isArray(state.meta.admins) && state.meta.admins.includes(currentUser.uid)) role = 'admin';
     }
-    // fallback to local role (when not signed-in to cloud)
-    if(role==='owner' || role==='admin') return true;
-    return state.meta && state.meta.publicEdit === true;
+    // fallback: when cloud has no admins, allow localRole to act as admin for convenience
+    const cloudHasAdmins = state && state.meta && (state.meta.ownerUid || (Array.isArray(state.meta.admins) && state.meta.admins.length>0));
+    if(role === 'guest' && !cloudHasAdmins && localRole) role = localRole;
   }
 
-  /* ---------------- UI ---------------- */
+  /* ---------------- UI / render ---------------- */
   function toast(text, timeout=3000){ const t=document.getElementById('toast'); t.innerText=text; t.style.display='block'; setTimeout(()=>t.style.display='none', timeout); }
   function renderAll(){ renderMap(); renderMarkers(); renderTops(); renderExplain(); updateOwnerInfo(); updateVisibility(); updateLastSaved(); }
-  function renderMap(){ const img=document.getElementById('mapPreview'); if(state.map && state.map.dataUrl){ img.src=state.map.dataUrl; img.style.display='block'; } else img.style.display='none'; }
+  function renderMap(){ const img=document.getElementById('mapPreview'); if(state && state.map && state.map.dataUrl){ img.src=state.map.dataUrl; img.style.display='block'; } else img.style.display='none'; }
   function renderMarkers(){ const wrap=document.getElementById('mapMarkers'); if(!wrap) return; wrap.innerHTML=''; const can=canEdit(); (state.players||[]).forEach(p=>{ const el=document.createElement('div'); el.className='card'; el.innerHTML = `<strong>${escapeHtml(p.name)}</strong><div class="small">Армия: ${p.army} • Поп: ${p.pop} • Терр: ${p.territories} • Счастье: ${p.happy}%</div><div style="margin-top:8px;display:flex;gap:6px"><button onclick="selectPlayer(${p.id})">Выбрать</button>${can?`<button onclick="openEditPlayer(${p.id})">Редактировать</button>`:''}</div>`; wrap.appendChild(el); }); }
   function renderTops(){ renderTable('topArmy','army'); renderTable('topPop','pop'); renderTable('topTerr','territories'); renderTable('topHappy','happy'); }
   function renderTable(elId,key){ const tbody=document.getElementById(elId).querySelector('tbody'); tbody.innerHTML=''; const arr=[...state.players].sort((a,b)=>b[key]-a[key]).slice(0,12); const can=canEdit(); arr.forEach((p,i)=>{ const tr=document.createElement('tr'); tr.innerHTML=`<td>${i+1}</td><td>${escapeHtml(p.name)}</td><td>${p[key]}</td><td>${can?'<button onclick="editRow('+p.id+')">✏️</button>':''}</td>`; tbody.appendChild(tr); }); }
@@ -390,16 +459,14 @@
   function updateVisibility(){
     const adminPanel=document.getElementById('admin');
     if(canEdit()){ adminPanel.style.display='block'; adminPanel.classList.remove('admin-only'); } else { adminPanel.style.display='none'; adminPanel.classList.add('admin-only'); }
-    // roleBadge: prefer cloud role if currentUser and cloud role gives admin; otherwise local role or guest
+    // roleBadge: prefer cloud role leading to admin; otherwise local role or guest
     let badgeText = 'Гость';
-    if(FIREBASE_ENABLED && db && currentUser){
-      if(canEditCloud()) badgeText = (state.meta && state.meta.ownerUid && currentUser.uid===state.meta.ownerUid) ? 'Владелец' : 'Админ';
-      else if(localRole && ! (state.meta && (state.meta.ownerUid || (Array.isArray(state.meta.admins) && state.meta.admins.length>0))) ){
-        badgeText = (localRole==='owner') ? 'Владелец' : 'Админ';
-      } else badgeText = 'Гость';
-    } else {
-      badgeText = (role==='owner') ? 'Владелец' : (role==='admin' ? 'Админ' : 'Гость');
-    }
+    if(currentUser && state && canEditCloud()){
+      badgeText = (state.meta && state.meta.ownerUid && currentUser.uid===state.meta.ownerUid) ? 'Владелец' : 'Админ';
+    } else if(!currentUser && role === 'owner') badgeText = 'Владелец';
+    else if(!currentUser && role === 'admin') badgeText = 'Админ';
+    else if(role === 'owner') badgeText = 'Владелец';
+    else if(role === 'admin') badgeText = 'Админ';
     document.getElementById('roleBadge').innerText = badgeText;
     if(currentUser){ document.getElementById('signinBtn').classList.add('hidden'); document.getElementById('signoutBtn').classList.remove('hidden'); }
     else { document.getElementById('signinBtn').classList.remove('hidden'); document.getElementById('signoutBtn').classList.add('hidden'); }
@@ -470,21 +537,22 @@
 
   /* ---------------- map upload ---------------- */
   document.addEventListener('DOMContentLoaded', ()=>{
-    const mapFile=document.getElementById('mapFile'); if(mapFile) mapFile.addEventListener('change', onMapFileChange);
-    const importFile=document.getElementById('importFile'); if(importFile) importFile.addEventListener('change', onImportFileChange);
+    document.getElementById('mapFile').addEventListener('change', onMapFileChange);
+    document.getElementById('importFile').addEventListener('change', onImportFileChange);
     document.getElementById('localLoginBtn').addEventListener('click', ()=>openModal());
-    document.getElementById('signinBtn').addEventListener('click', ()=>{ if(firebaseAvailable()) signInWithGoogle(); else toast('Firebase отключён'); });
-    document.getElementById('signoutBtn').addEventListener('click', ()=>{ if(firebaseAvailable()) auth.signOut(); else localLogout(); });
+    document.getElementById('signinBtn').addEventListener('click', ()=>{ if(FIREBASE_ENABLED) signInWithGoogle(); else toast('Firebase отключён'); });
+    document.getElementById('signoutBtn').addEventListener('click', ()=>{ if(firebaseAvailable() && auth) auth.signOut().then(()=>{ currentUser=null; determineRoleFromState(); updateVisibility(); toast('Вышли из Google'); }); else localLogout(); });
     const welcome = document.getElementById('welcomeText');
     welcome.addEventListener('input', ()=>{ state.welcome = welcome.innerText; saveStateLocal(); });
     welcome.addEventListener('blur', ()=>{ state.welcome = welcome.innerText; saveStateLocal(); });
+    // load local immediately for quick UI, then init firebase and try cloud sync
+    state = loadStateLocal();
+    localRole = loadLocalRole();
     renderAll();
-    updateLastSaved();
+    initFirebaseAndSync();
   });
 
-  function firebaseAvailable(){ return FIREBASE_ENABLED && typeof firebase !== 'undefined' && auth; }
-
-  async function onMapFileChange(e){
+  function onMapFileChange(e){
     const f = e.target.files[0]; if(!f) return;
     lastMapFile = f;
     const reader=new FileReader(); reader.onload=()=>{ state.map.dataUrl = reader.result; state.map.name=f.name; renderMap(); saveStateLocal(); };
@@ -496,6 +564,7 @@
 
   /* ---------------- players ---------------- */
   function selectPlayer(id){ const p=state.players.find(x=>x.id===id); if(!p) return toast('Племя не найдено'); window.selectedPlayer=p; toast('Выбран: '+p.name); }
+  function editRow(id){ if(!canEdit()) return toast('Требуется роль Админ/Владелец'); openEditPlayer(id); }
   function openEditPlayer(id){ if(!canEdit()) return toast('Требуется роль Админ/Владелец'); const p=state.players.find(x=>x.id===id); if(!p) return; const name=prompt('Название племени', p.name); if(name!==null) p.name=name; const army=parseInt(prompt('Армия', p.army))||p.army; const pop=parseInt(prompt('Население', p.pop))||p.pop; const terr=parseInt(prompt('Территории', p.territories))||p.territories; const happy=parseInt(prompt('Счастье (0-100)', p.happy))||p.happy; p.army=army; p.pop=pop; p.territories=terr; p.happy=happy; saveStateLocal(); toast('Изменения сохранены локально. Нажмите "Подтвердить изменения (в облако)" чтобы синхронизировать.'); }
 
   /* ---------------- admin utils ---------------- */
@@ -511,36 +580,20 @@
   function onImportClick(){ document.getElementById('importFile').click(); }
   function onImportFileChange(e){ const f=e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=async ()=>{ try{ const obj=JSON.parse(r.result); if(obj && obj.players){ if(!confirm('Импортировать и заменить данные?')) return; state=obj; saveStateLocal(); toast('Данные импортированы локально. Нажмите "Подтвердить изменения (в облако)" для синхронизации.'); } else toast('Неверный файл'); } catch(err){ toast('Ошибка парсинга'); } }; r.readAsText(f); e.target.value=''; }
 
-  /* ---------------- local auth modal (FIXED) ---------------- */
-  function openModal(){
-    const modal = document.getElementById('modalLogin');
-    modal.classList.remove('hidden');
-    modal.style.display = 'flex';
-  }
-  function closeModal(){
-    const modal = document.getElementById('modalLogin');
-    modal.classList.add('hidden');
-    modal.style.display = 'none';
-  }
-  function localLogin(){
-    const roleSel=document.getElementById('localRoleSelect').value;
-    const pass=document.getElementById('localPassword').value;
-    if(!pass) return toast('Введите пароль');
-    const meta=state.meta||{};
-    if(roleSel==='owner' && pass===meta.ownerPass){ role='owner'; saveLocalRole('owner'); closeModal(); saveStateLocal(); updateVisibility(); toast('Вход как Владелец (локально)'); return; }
-    if(roleSel==='admin' && pass===meta.adminPass){ role='admin'; saveLocalRole('admin'); closeModal(); saveStateLocal(); updateVisibility(); toast('Вход как Админ (локально)'); return; }
-    toast('Неверный локальный пароль');
-  }
+  /* ---------------- local auth modal ---------------- */
+  function openModal(){ const modal = document.getElementById('modalLogin'); modal.classList.remove('hidden'); modal.style.display = 'flex'; }
+  function closeModal(){ const modal = document.getElementById('modalLogin'); modal.classList.add('hidden'); modal.style.display = 'none'; }
+  function localLogin(){ const roleSel=document.getElementById('localRoleSelect').value; const pass=document.getElementById('localPassword').value; if(!pass) return toast('Введите пароль'); const meta=state.meta||{}; if(roleSel==='owner' && pass===meta.ownerPass){ role='owner'; saveLocalRole('owner'); closeModal(); saveStateLocal(); updateVisibility(); toast('Вход как Владелец (локально)'); return; } if(roleSel==='admin' && pass===meta.adminPass){ role='admin'; saveLocalRole('admin'); closeModal(); saveStateLocal(); updateVisibility(); toast('Вход как Админ (локально)'); return; } toast('Неверный локальный пароль'); }
   function assignLocalOwner(){ if(!confirm('Назначить локального владельца?')) return; const name=prompt('Отображаемое имя владельца', state.meta.ownerName||'Владелец'); if(!name) return; state.meta.ownerName=name; state.meta.ownerPass=prompt('Установите локальный пароль владельца', state.meta.ownerPass||''); saveStateLocal(); toast('Локальный владелец назначен'); }
   function changeLocalPasswords(){ if(!canEdit()) return toast('Только владелец/админ может менять пароли'); const op=prompt('Новый пароль владельца (оставьте пустым чтобы не менять)'); if(op) state.meta.ownerPass=op; const ap=prompt('Новый пароль админа (оставьте пустым чтобы не менять)'); if(ap) state.meta.adminPass=ap; saveStateLocal(); toast('Локальные пароли обновлены'); }
 
-  /* ---------------- Firebase helpers (Google sign-in with robust error handling) ---------------- */
+  /* ---------------- Firebase helpers (Google sign-in) ---------------- */
   async function signInWithGoogle(){
-    if(!firebaseAvailable()) return toast('Firebase не настроен');
+    if(!firebaseAvailable()) return toast('Firebase не настроен или недоступен');
     const provider = new firebase.auth.GoogleAuthProvider();
     try{
       await auth.signInWithPopup(provider);
-      // onAuthStateChanged handler will handle UI update and subscription
+      // onAuthStateChanged will handle UI update
     } catch(err){
       console.error('Google sign-in error', err);
       if(err.code === 'auth/popup-blocked') toast('Окно входа заблокировано браузером — разрешите всплывающие окна и попробуйте снова');
@@ -549,18 +602,56 @@
     }
   }
   function localLogout(){ currentUser=null; role = localRole || 'guest'; updateVisibility(); toast('Вышли локально'); }
-  function showLastSaved(){ const ls=state.updatedAt?new Date(state.updatedAt).toLocaleString():'никогда'; document.getElementById('lastSaved').innerText='Последнее сохранение: '+ls; toast('Время последнего сохранения показано'); }
-  function updateLastSaved(){ if(state.updatedAt) document.getElementById('lastSaved').innerText='Последнее сохранение: '+new Date(state.updatedAt).toLocaleString(); }
-  async function setAsOwner(){ if(!firebaseAvailable()||!currentUser) return toast('Войдите через Google и включите Firebase'); state.meta.ownerUid=currentUser.uid; state.meta.ownerName=currentUser.displayName||currentUser.email; await saveStateCloud(); toast('Вы назначены владельцем (облако)'); }
-  function addAdminByUid(){ const uid=document.getElementById('newAdminUid').value.trim(); if(!uid) return toast('Введите UID'); state.meta.admins=state.meta.admins||[]; if(!state.meta.admins.includes(uid)) state.meta.admins.push(uid); saveStateLocal(); toast('UID добавлен в админы (локально). Нажмите "Подтвердить изменения (в облако)" чтобы применить.'); }
 
-  /* ---------------- Push local to cloud (confirm) ---------------- */
+  /* ---------------- cloud permissions and save ---------------- */
+  function canEditCloud(){ if(!currentUser || !state || !state.meta) return false; if(state.meta.ownerUid && currentUser.uid === state.meta.ownerUid) return true; if(Array.isArray(state.meta.admins) && state.meta.admins.includes(currentUser.uid)) return true; return false; }
+  function canEdit(){
+    // prefer cloud permissions if logged into cloud and db available
+    if(firebaseAvailable() && db && currentUser){
+      if(canEditCloud()) return true;
+      // if cloud has no admins and localRole exists -> allow localRole for convenience
+      const cloudHasAdmins = state.meta && (state.meta.ownerUid || (Array.isArray(state.meta.admins) && state.meta.admins.length>0));
+      if(!cloudHasAdmins && localRole) return (localRole==='owner' || localRole==='admin');
+      return false;
+    }
+    // not using cloud: fallback to local role / publicEdit
+    if(role==='owner' || role==='admin') return true;
+    return state.meta && state.meta.publicEdit === true;
+  }
+
+  async function saveStateCloud(){
+    if(!db) return saveStateLocal();
+    // permission check
+    if(!canEditCloud()){
+      const cloudHasAdmins = state.meta && (state.meta.ownerUid || (Array.isArray(state.meta.admins) && state.meta.admins.length>0));
+      if(!cloudHasAdmins && currentUser){
+        // claim ownership if user confirms
+        if(!confirm('В облаке не назначен владелец/админы. Вы хотите назначить себя владельцем в облаке и записать изменения?')) return toast('Сохранение в облако отменено');
+        state.meta.ownerUid = currentUser.uid;
+        state.meta.ownerName = currentUser.displayName || currentUser.email || ('uid:' + currentUser.uid);
+      } else {
+        toast('Нет прав для записи в облако'); return;
+      }
+    }
+    try {
+      const ref = db.collection('site').doc('state');
+      state.updatedAt = Date.now();
+      await ref.set(state);
+      saveStateLocal();
+      toast('Данные сохранены в облаке');
+      updateLastSaved();
+    } catch(e){
+      console.error('saveStateCloud error', e);
+      toast('Ошибка сохранения в облако: ' + (e.message || e.code || 'unknown'));
+    }
+  }
+
   async function pushLocalToCloud(){
     if(!firebaseAvailable()) return toast('Firebase отключён или не настроен');
     if(!currentUser) return toast('Войдите в Google, чтобы подтвердить изменения в облаке');
-    if(!canEditCloud()) return toast('Требуется роль админ/владелец в облаке');
-    try{
-      if(lastMapFile){
+    try {
+      // If there's a new map file pending, upload it first
+      if(lastMapFile && storage){
         const path = `maps/${Date.now()}_${lastMapFile.name.replace(/\s+/g,'_')}`;
         const ref = storage.ref().child(path);
         await ref.put(lastMapFile);
@@ -570,20 +661,45 @@
         lastMapFile = null;
       }
       await saveStateCloud();
-      toast('Все локальные изменения подтверждены и сохранены в облаке');
-    } catch(err){ console.error(err); toast('Ошибка при синхронизации в облако: ' + (err.message || err.code || 'unknown')); }
+    } catch(e){
+      console.error('pushLocalToCloud error', e);
+      toast('Ошибка при синхронизации в облако: ' + (e.message || e.code || 'unknown'));
+    }
   }
 
-  async function forceSave(){ if(firebaseAvailable() && currentUser && canEditCloud()) await pushLocalToCloud(); else saveStateLocal(); toast('Сохранено'); }
+  async function forceSave(){ if(firebaseAvailable() && currentUser) await pushLocalToCloud(); else saveStateLocal(); toast('Сохранено'); }
+
+  /* ---------------- Load cloud -> local (force) ---------------- */
+  async function loadCloudToLocal(){
+    if(!firebaseAvailable()) return toast('Firebase отключён или не настроен');
+    try{
+      const ref = db.collection('site').doc('state');
+      const snap = await ref.get();
+      if(!snap.exists){ toast('В облаке нет данных'); return; }
+      if(!confirm('Загрузить данные из облака и перезаписать локальные? (локальные несохранённые изменения будут потеряны)')) return;
+      const cloud = snap.data();
+      state = cloud;
+      saveStateLocal();
+      toast('Данные загружены из облака и применены локально');
+      renderAll();
+    } catch(err){ console.error(err); toast('Ошибка чтения из облака: ' + (err.message || err.code)); }
+  }
 
   /* ---------------- misc ---------------- */
   function quickAction(action){ if(action==='giveEnergyAll'){ state.players.forEach(p=>p.energy=Math.min(100,(p.energy||0)+20)); saveStateLocal(); toast('+20 ⚡ всем (локально)'); } else if(action==='randomEvent') randomEvent(); }
   function showSection(name){ document.getElementById('section-map').style.display = (name==='map') ? 'block':'none'; document.getElementById('section-explain').style.display = (name==='explain') ? 'block':'none'; document.getElementById('section-tops').style.display = (name==='tops') ? 'block':'none'; if(name==='map') renderMap(); }
   function onImportFileChange(e){ /* handled above */ }
-  document.addEventListener('DOMContentLoaded', ()=>{ if(!state.explain || Object.keys(state.explain).length===0){ defaultExplainBlocks.forEach(b => state.explain[b.id] = { id:b.id, title:b.title, summary:b.summary, content:b.content }); saveStateLocal(); } renderAll(); window._state = state; window._pushCloud = pushLocalToCloud; });
+  function showLastSaved(){ const ls=state.updatedAt?new Date(state.updatedAt).toLocaleString():'никогда'; document.getElementById('lastSaved').innerText='Последнее сохранение: '+ls; toast('Время последнего сохранения показано'); }
+  function updateLastSaved(){ if(state && state.updatedAt) document.getElementById('lastSaved').innerText='Последнее сохранение: '+new Date(state.updatedAt).toLocaleString(); }
+
+  async function setAsOwner(){ if(!firebaseAvailable()||!currentUser) return toast('Войдите через Google и включите Firebase'); state.meta.ownerUid=currentUser.uid; state.meta.ownerName=currentUser.displayName||currentUser.email; await saveStateCloud(); toast('Вы назначены владельцем (облако)'); }
+  function addAdminByUid(){ const uid=document.getElementById('newAdminUid').value.trim(); if(!uid) return toast('Введите UID'); state.meta.admins=state.meta.admins||[]; if(!state.meta.admins.includes(uid)) state.meta.admins.push(uid); saveStateLocal(); toast('UID добавлен в админы (локально). Нажмите "Подтвердить изменения (в облако)" чтобы применить.'); }
+
+  /* ---------------- startup helper exposure ---------------- */
+  window._state = () => state;
+  window._pushCloud = pushLocalToCloud;
+  window._loadCloud = loadCloudToLocal;
 
   </script>
 </body>
 </html>
-
-
